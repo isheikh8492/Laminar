@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/bench/">
+    <Project Path="bench/Laminar.Benchmarks/Laminar.Benchmarks.csproj" />
+    <Project Path="bench/Laminar.TestBench/Laminar.TestBench.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Laminar.Core/Laminar.Core.csproj" />
+    <Project Path="src/Laminar.Ingestion/Laminar.Ingestion.csproj" />
+    <Project Path="src/Laminar.Sources.Simulation/Laminar.Sources.Simulation.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Laminar.Architecture.Tests/Laminar.Architecture.Tests.csproj" />
+    <Project Path="tests/Laminar.Core.Tests/Laminar.Core.Tests.csproj" />
+    <Project Path="tests/Laminar.Ingestion.Tests/Laminar.Ingestion.Tests.csproj" />
+  </Folder>
+</Solution>

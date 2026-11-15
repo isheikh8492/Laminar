@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Laminar.Ingestion\Laminar.Ingestion.csproj" />
+    <ProjectReference Include="..\..\src\Laminar.Sources.Simulation\Laminar.Sources.Simulation.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+</Project>

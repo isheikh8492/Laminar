@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\Laminar.Core\Laminar.Core.csproj" />
+  </ItemGroup>
+</Project>
