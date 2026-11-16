@@ -217,21 +217,44 @@ public sealed class Batch<T> : IDisposable
     /// </exception>
     public ReadOnlySpan<TItem> GetPayload<TItem>(PayloadSlice<TItem> slice)
         where TItem : unmanaged
+        => Payload.Get(slice);
+
+    /// <summary>
+    /// Returns the items a <see cref="PayloadSlice{TItem}"/> points at, writable, for the source to
+    /// fill or change before pushing the batch.
+    /// </summary>
+    /// <remarks>
+    /// Use this to get a fresh span after later <see cref="AllocatePayload"/> calls may have moved
+    /// the buffer. The typical case is nested items that hold slices themselves: allocate the
+    /// parent items, then each child's data, then write each parent item through this method.
+    /// The same rule applies to the result: it is only valid until the next allocation.
+    /// </remarks>
+    /// <exception cref="ObjectDisposedException">The batch has been disposed.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="slice"/> is outside the payload in use, so it can't have come from this batch.
+    /// </exception>
+    public Span<TItem> GetWritablePayload<TItem>(PayloadSlice<TItem> slice)
+        where TItem : unmanaged
     {
-        _ = GetArray(); // Throws if disposed.
+        ReadOnlySpan<TItem> items = Payload.Get(slice); // Checks disposal and bounds.
 
-        if (slice.IsEmpty)
+        // Same memory, without the read-only wrapper. Allowed here because the batch owns the
+        // buffer and the source still owns the batch.
+        return MemoryMarshal.CreateSpan(ref MemoryMarshal.GetReference(items), items.Length);
+    }
+
+    /// <summary>
+    /// Read access to the payload buffer, for code that resolves many slices (such as a layout
+    /// store). Use it only while the batch is alive.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The batch has been disposed.</exception>
+    public PayloadReader Payload
+    {
+        get
         {
-            return [];
+            _ = GetArray(); // Throws if disposed.
+            return new PayloadReader(_payload, PayloadBytesUsed);
         }
-
-        long end = slice.Offset + ((long)slice.Length * Unsafe.SizeOf<TItem>());
-        if (slice.Offset < 0 || slice.Length < 0 || end > PayloadBytesUsed || _payload is null)
-        {
-            throw new ArgumentOutOfRangeException(nameof(slice), slice, "The slice is outside this batch's payload.");
-        }
-
-        return MemoryMarshal.Cast<byte, TItem>(_payload.AsSpan(slice.Offset, (int)end - slice.Offset));
     }
 
     /// <summary>
