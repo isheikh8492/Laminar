@@ -1,6 +1,6 @@
 # 0002. Push-based sources, bounded buffer, store as the source of truth
 
-**Status:** Accepted
+**Status:** Accepted. Extended by ADR 0006: a chunk is freed once recorded **and** outside its table's retention window.
 
 ## Context
 

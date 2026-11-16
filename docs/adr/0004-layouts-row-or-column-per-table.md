@@ -1,6 +1,6 @@
 # 0004. Layouts: row or column storage chosen per part of a nested record
 
-**Status:** Accepted
+**Status:** Accepted. Extended by ADR 0006: each table also has a retention.
 
 Extends ADR 0001. Replaces its column store whose "fields are discovered once per type", and its
 note that variable-length data would need a list column later.
