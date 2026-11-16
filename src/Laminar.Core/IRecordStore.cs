@@ -23,11 +23,13 @@ public interface IRecordStore<T>
     long Count { get; }
 
     /// <summary>
-    /// Copies <paramref name="records"/> into the store.
+    /// Copies the batch's records, and any payload they point at, into the store.
     /// </summary>
-    /// <param name="records">
-    /// The records to add. The store must copy them before returning and never keep the span,
-    /// because the memory behind it goes back to the pool afterwards.
+    /// <param name="batch">
+    /// The batch to add, read-only. The whole batch is passed, not just its records, so a store
+    /// can resolve the records' <see cref="PayloadSlice{TItem}"/> values (ADR 0004). The store must
+    /// copy what it needs before returning and never keep the batch or any span from it: the
+    /// caller disposes the batch afterwards, and its memory goes back to the pool.
     /// </param>
-    void Append(ReadOnlySpan<T> records);
+    void Append(Batch<T> batch);
 }

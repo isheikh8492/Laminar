@@ -78,6 +78,20 @@ public sealed class RowStore<T> : IRecordStore<T>
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Stores the records only. Payload slices inside them are kept as plain numbers, which mean
+    /// nothing once the batch is gone; records with payload need a layout store (ADR 0004).
+    /// Must only be called from one thread at a time.
+    /// </remarks>
+    public void Append(Batch<T> batch)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        Append(batch.Records);
+    }
+
+    /// <summary>
+    /// Copies <paramref name="records"/> into the store.
+    /// </summary>
     /// <remarks>Must only be called from one thread at a time.</remarks>
     public void Append(ReadOnlySpan<T> records)
     {

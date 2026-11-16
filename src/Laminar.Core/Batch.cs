@@ -1,6 +1,7 @@
 ﻿using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace Laminar.Core;
 
@@ -31,6 +32,13 @@ namespace Laminar.Core;
 /// after pushing it is a bug.
 /// </para>
 /// <para>
+/// <b>Payload (ADR 0004):</b> records with nested, variable-length data (such as a waveform per
+/// event) keep that data in the batch's payload buffer, a second pooled array of bytes. The source
+/// calls <see cref="AllocatePayload"/> for each record's nested data and stores the returned
+/// <see cref="PayloadSlice{TItem}"/> in the record. Stores read it back with
+/// <see cref="GetPayload"/>. The payload buffer is only rented when first used.
+/// </para>
+/// <para>
 /// This is a class, not a struct, on purpose: copies of a struct would share the same pooled array,
 /// and disposing two copies would return it to the pool twice.
 /// </para>
@@ -39,6 +47,15 @@ public sealed class Batch<T> : IDisposable
 {
     // The borrowed array. Null once the batch is disposed.
     private T[]? _array;
+
+    // The borrowed payload bytes. Null until the first AllocatePayload, and again once disposed.
+    private byte[]? _payload;
+
+    // Payload items start on 8-byte boundaries, so any primitive type can be read efficiently.
+    private const int PayloadAlignment = 8;
+
+    // The smallest payload buffer rented, so tiny first allocations don't grow it again at once.
+    private const int MinimumPayloadBytes = 256;
 
     /// <summary>
     /// Creates an empty batch with room for at least <paramref name="capacity"/> records.
@@ -51,10 +68,23 @@ public sealed class Batch<T> : IDisposable
     /// This batch's position in the source's stream: 0 for the first batch, increasing by 1 each
     /// time. Lets downstream code detect missing batches.
     /// </param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is zero or negative.</exception>
-    public Batch(int capacity, long sequence)
+    /// <param name="payloadBytes">
+    /// How many payload bytes to reserve up front, if the source knows roughly how much nested data
+    /// the batch will carry. 0 (the default) rents nothing until <see cref="AllocatePayload"/> is
+    /// first called. The buffer grows when needed either way.
+    /// </param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="capacity"/> is zero or negative, or <paramref name="payloadBytes"/> is negative.
+    /// </exception>
+    public Batch(int capacity, long sequence, int payloadBytes = 0)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity);
+        ArgumentOutOfRangeException.ThrowIfNegative(payloadBytes);
+
+        if (payloadBytes > 0)
+        {
+            _payload = ArrayPool<byte>.Shared.Rent(payloadBytes);
+        }
 
         _array = ArrayPool<T>.Shared.Rent(capacity);
         Capacity = _array.Length;
@@ -128,7 +158,84 @@ public sealed class Batch<T> : IDisposable
     }
 
     /// <summary>
-    /// Returns the array to the pool. After this, <see cref="Buffer"/>, <see cref="Records"/> and
+    /// How many payload bytes are in use, including alignment padding between slices.
+    /// </summary>
+    public int PayloadBytesUsed { get; private set; }
+
+    /// <summary>
+    /// Reserves room for <paramref name="count"/> items of nested data in the payload buffer and
+    /// returns where they are, for the record to keep.
+    /// </summary>
+    /// <typeparam name="TItem">The item type, such as <see cref="short"/> for waveform samples.</typeparam>
+    /// <param name="count">How many items to reserve. 0 gives an empty slice.</param>
+    /// <param name="items">
+    /// The reserved items, writable, for the source to fill. <b>Fill them before the next call:</b>
+    /// a later call may grow the buffer, moving it to a new array, and this span would then point
+    /// at the old one. The slice stays valid either way, because it holds a position, not memory.
+    /// </param>
+    /// <returns>The slice to store in the record.</returns>
+    /// <exception cref="ObjectDisposedException">The batch has been disposed.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="count"/> is negative, or the payload would exceed the largest possible array.
+    /// </exception>
+    public PayloadSlice<TItem> AllocatePayload<TItem>(int count, out Span<TItem> items)
+        where TItem : unmanaged
+    {
+        _ = GetArray(); // Throws if disposed.
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+
+        if (count == 0)
+        {
+            items = [];
+            return default;
+        }
+
+        // Round the start up to the next multiple of 8. (x + 7) & ~7 does that with bit masks:
+        // ~7 is all ones except the lowest three bits, so the & clears them.
+        int start = (PayloadBytesUsed + PayloadAlignment - 1) & ~(PayloadAlignment - 1);
+        long end = start + ((long)count * Unsafe.SizeOf<TItem>());
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(end, Array.MaxLength, nameof(count));
+
+        byte[] payload = EnsurePayloadCapacity((int)end);
+        PayloadBytesUsed = (int)end;
+
+        // View the reserved bytes as TItems. Nothing is copied.
+        items = MemoryMarshal.Cast<byte, TItem>(payload.AsSpan(start, (int)end - start));
+        return new PayloadSlice<TItem>(start, count);
+    }
+
+    /// <summary>
+    /// Returns the items a <see cref="PayloadSlice{TItem}"/> points at, read-only.
+    /// </summary>
+    /// <remarks>
+    /// A view of the payload buffer; nothing is copied. Use it right away and don't keep it: the
+    /// buffer goes back to the pool when the batch is disposed.
+    /// </remarks>
+    /// <exception cref="ObjectDisposedException">The batch has been disposed.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="slice"/> is outside the payload in use, so it can't have come from this batch.
+    /// </exception>
+    public ReadOnlySpan<TItem> GetPayload<TItem>(PayloadSlice<TItem> slice)
+        where TItem : unmanaged
+    {
+        _ = GetArray(); // Throws if disposed.
+
+        if (slice.IsEmpty)
+        {
+            return [];
+        }
+
+        long end = slice.Offset + ((long)slice.Length * Unsafe.SizeOf<TItem>());
+        if (slice.Offset < 0 || slice.Length < 0 || end > PayloadBytesUsed || _payload is null)
+        {
+            throw new ArgumentOutOfRangeException(nameof(slice), slice, "The slice is outside this batch's payload.");
+        }
+
+        return MemoryMarshal.Cast<byte, TItem>(_payload.AsSpan(slice.Offset, (int)end - slice.Offset));
+    }
+
+    /// <summary>
+    /// Returns the arrays to the pool. After this, <see cref="Buffer"/>, <see cref="Records"/> and
     /// <see cref="SetCount"/> throw <see cref="ObjectDisposedException"/>.
     /// </summary>
     /// <remarks>
@@ -148,6 +255,40 @@ public sealed class Batch<T> : IDisposable
         }
 
         ArrayPool<T>.Shared.Return(array, clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+
+        // Only the caller that won the exchange above gets here, so this runs once. Payload bytes
+        // hold no references, so they never need clearing.
+        byte[]? payload = _payload;
+        _payload = null;
+        if (payload is not null)
+        {
+            ArrayPool<byte>.Shared.Return(payload);
+        }
+    }
+
+    // Makes sure the payload buffer holds at least `needed` bytes, growing it if necessary, and
+    // returns it. Growing rents a bigger array, copies the bytes in use, and returns the old one.
+    private byte[] EnsurePayloadCapacity(int needed)
+    {
+        byte[]? current = _payload;
+        if (current is not null && current.Length >= needed)
+        {
+            return current;
+        }
+
+        // Double, so a batch filled one record at a time grows only a few times.
+        int doubled = (int)Math.Min((long)(current?.Length ?? 0) * 2, Array.MaxLength);
+        int size = Math.Max(needed, Math.Max(doubled, MinimumPayloadBytes));
+        byte[] bigger = ArrayPool<byte>.Shared.Rent(size);
+
+        if (current is not null)
+        {
+            current.AsSpan(0, PayloadBytesUsed).CopyTo(bigger);
+            ArrayPool<byte>.Shared.Return(current);
+        }
+
+        _payload = bigger;
+        return bigger;
     }
 
     // Returns the array, or throws if the batch is disposed. Reads the field once into a local,

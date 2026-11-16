@@ -64,7 +64,7 @@ public sealed class IngestionWorker<T>
             {
                 try
                 {
-                    _store.Append(batch.Records);
+                    _store.Append(batch);
                 }
                 catch (Exception ex)
                 {
