@@ -1,4 +1,4 @@
-using Laminar.Core;
+﻿using Laminar.Core;
 
 namespace Laminar.Ingestion.Layout;
 
@@ -14,6 +14,7 @@ namespace Laminar.Ingestion.Layout;
 /// and conditions when the fields are only known at runtime.
 /// </remarks>
 public sealed class TableBuilder<TOwner>
+    where TOwner : unmanaged
 {
     private readonly LayoutContext _context;
     private readonly int _index;

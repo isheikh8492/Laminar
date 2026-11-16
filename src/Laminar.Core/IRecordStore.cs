@@ -15,7 +15,16 @@ namespace Laminar.Core;
 /// </para>
 /// </remarks>
 public interface IRecordStore<T>
+    where T : unmanaged
 {
+    /// <summary>
+    /// Allocates room for at least <paramref name="records"/> records in advance, so they can be
+    /// appended without allocating (ADR 0005). Called by the pipeline in <c>Prepare</c>, before
+    /// any append. A store that reserves nothing may do nothing.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="records"/> is negative.</exception>
+    void Reserve(long records);
+
     /// <summary>
     /// How many records the store holds. A <see cref="long"/>, because a long run can exceed
     /// <see cref="int.MaxValue"/> records.

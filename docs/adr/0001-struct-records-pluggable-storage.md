@@ -1,7 +1,7 @@
-# 0001. Struct-defined records and pluggable storage
+﻿# 0001. Struct-defined records and pluggable storage
 
-**Status:** Accepted. Partly superseded by ADR 0003: the `unmanaged` constraint applies to the
-stores and zero-copy decoding, not the whole pipeline. Extended by ADR 0004: storage is chosen
+**Status:** Accepted. ADR 0003 relaxed the `unmanaged` rule to stores only; ADR 0005 superseded
+it and restored the rule everywhere. Extended by ADR 0004: storage is chosen
 per part of a record through a layout, and nested data is stored with offsets.
 
 ## Context

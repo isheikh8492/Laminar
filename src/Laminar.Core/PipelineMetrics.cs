@@ -35,6 +35,14 @@ namespace Laminar.Core;
 /// </param>
 /// <param name="RecordsInFlight">Records in the batches in flight.</param>
 /// <param name="BufferCapacity">How many batches the buffer can hold.</param>
+/// <param name="BatchesAllocatedAfterPrepare">
+/// Batches created because the pipeline's pool ran dry (ADR 0005). Above zero means the pool was
+/// sized too small.
+/// </param>
+/// <param name="PayloadGrowths">
+/// Times a batch's payload outgrew its buffer. Above zero means the payload size per batch was too
+/// small.
+/// </param>
 public readonly record struct PipelineMetrics(
     long BatchesWritten,
     long RecordsWritten,
@@ -46,7 +54,9 @@ public readonly record struct PipelineMetrics(
     long RecordsBuffered,
     long BatchesInFlight,
     long RecordsInFlight,
-    int BufferCapacity)
+    int BufferCapacity,
+    long BatchesAllocatedAfterPrepare = 0,
+    long PayloadGrowths = 0)
 {
     /// <summary>
     /// How full the buffer is, from 0 (empty) to 1 (full). The key health metric (ADR 0002): a

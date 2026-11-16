@@ -1,4 +1,4 @@
-using Laminar.Core;
+﻿using Laminar.Core;
 
 namespace Laminar.Ingestion.Layout;
 
@@ -24,6 +24,7 @@ namespace Laminar.Ingestion.Layout;
 /// </para>
 /// </remarks>
 public sealed class LayoutStore<T> : IRecordStore<T>
+    where T : unmanaged
 {
     private readonly TableWriter<T> _root;
     private readonly LayoutColumns _columns;
@@ -51,6 +52,49 @@ public sealed class LayoutStore<T> : IRecordStore<T>
     /// <inheritdoc/>
     /// <remarks>The number of records, which is the number of items in the root table.</remarks>
     public long Count => Volatile.Read(ref _count);
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Reserves every column of the root table, and the offsets of each nested table. Nested items
+    /// aren't reserved here, because how many each record has isn't known; reserve those with
+    /// <see cref="ReserveNested"/>. Must be called from the writer's thread, or before appending starts.
+    /// </remarks>
+    public void Reserve(long records)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(records);
+        _root.Reserve(records);
+    }
+
+    /// <summary>
+    /// Reserves room for <paramref name="items"/> items in one nested table, for example the total
+    /// number of waveform samples expected: records × average samples per record.
+    /// </summary>
+    /// <param name="table">The nested table's name.</param>
+    /// <param name="items">How many items to make room for.</param>
+    /// <exception cref="KeyNotFoundException">There is no such nested table.</exception>
+    /// <remarks>
+    /// Reserves the table's own rows or columns. Tables nested inside it are not reserved; call
+    /// this for each of them too. Must be called from the writer's thread, or before appending starts.
+    /// </remarks>
+    public void ReserveNested(string table, long items)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(items);
+        TableSchema schema = Schema.Find(table) ?? throw new KeyNotFoundException($"There is no table called '{table}'.");
+        if (schema.Parent is null)
+        {
+            throw new KeyNotFoundException($"'{table}' is the root table; reserve it with Reserve.");
+        }
+
+        if (_columns.Rows.TryGetValue(table, out object? rows))
+        {
+            ((IReservable)rows).Reserve(items);
+        }
+
+        foreach (FieldSchema field in schema.Fields)
+        {
+            ((IReservable)_columns.Fields[(table, field.Name)]).Reserve(items);
+        }
+    }
 
     /// <inheritdoc/>
     /// <remarks>Must only be called from one thread at a time.</remarks>

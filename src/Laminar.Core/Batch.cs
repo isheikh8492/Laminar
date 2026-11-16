@@ -9,69 +9,94 @@ namespace Laminar.Core;
 /// A group of records moving through the pipeline together, from a source to a store.
 /// </summary>
 /// <typeparam name="T">
-/// The record type. Any type is allowed (ADR 0003); stores may require <c>unmanaged</c> structs.
+/// The record type: an <see langword="unmanaged"/> struct (ADR 0005), so a batch's records are
+/// plain memory with no references for the garbage collector to follow.
 /// </typeparam>
 /// <remarks>
 /// <para>
-/// A batch borrows its array from <see cref="ArrayPool{T}.Shared"/> and returns it in
-/// <see cref="Dispose"/>, so the pipeline creates almost no garbage after startup.
+/// <b>Two kinds of batch:</b>
 /// </para>
+/// <list type="bullet">
+///   <item><b>Pooled</b> (the normal case): rented from a pipeline's <see cref="BatchPool{T}"/>
+///   through <see cref="IBatchWriter{T}.RentBatch"/>. Its arrays are allocated once, in
+///   <c>Prepare</c>, and <see cref="Dispose"/> hands the whole batch back to the pool for reuse.</item>
+///   <item><b>Standalone</b>: created with the public constructor, for tools and benchmarks
+///   outside a pipeline. It borrows its arrays from the shared <see cref="ArrayPool{T}"/> and
+///   returns them in <see cref="Dispose"/>.</item>
+/// </list>
 /// <para>
 /// <b>Ownership:</b> exactly one component owns a batch at a time, and the last owner disposes it.
 /// </para>
 /// <list type="table">
 ///   <listheader><term>Moment</term><description>Who disposes</description></listheader>
-///   <item><term>Created, being filled</term><description>The source, if it decides not to push.</description></item>
+///   <item><term>Rented, being filled</term><description>The source, if it decides not to push.</description></item>
 ///   <item><term>Pushed to a writer</term><description>Ownership passes to the writer, even if the batch is dropped.</description></item>
 ///   <item><term>Dropped by the full-buffer policy</term><description>The buffer, immediately.</description></item>
 ///   <item><term>Taken by the ingestion worker</term><description>The worker, after the store has copied the records.</description></item>
 /// </list>
 /// <para>
+/// Using a pooled batch after disposing it is a serious bug: it may already have been rented again
+/// by another source. That can't always be detected.
+/// </para>
+/// <para>
 /// <b>Usage:</b> the source writes records into <see cref="Buffer"/>, calls <see cref="SetCount"/>,
-/// then pushes the batch. After that, everyone reads <see cref="Records"/> only. Writing to a batch
-/// after pushing it is a bug.
+/// then pushes the batch. After that, everyone reads <see cref="Records"/> only.
 /// </para>
 /// <para>
 /// <b>Payload (ADR 0004):</b> records with nested, variable-length data (such as a waveform per
-/// event) keep that data in the batch's payload buffer, a second pooled array of bytes. The source
-/// calls <see cref="AllocatePayload"/> for each record's nested data and stores the returned
-/// <see cref="PayloadSlice{TItem}"/> in the record. Stores read it back with
-/// <see cref="GetPayload"/>. The payload buffer is only rented when first used.
+/// event) keep that data in the batch's payload buffer. The source calls
+/// <see cref="AllocatePayload"/> for each record's nested data and stores the returned
+/// <see cref="PayloadSlice{TItem}"/> in the record. Stores read it back through
+/// <see cref="Payload"/>.
 /// </para>
 /// <para>
-/// This is a class, not a struct, on purpose: copies of a struct would share the same pooled array,
-/// and disposing two copies would return it to the pool twice.
+/// This is a class, not a struct, on purpose: copies of a struct would share the same arrays, and
+/// disposing two copies would return them twice.
 /// </para>
 /// </remarks>
 public sealed class Batch<T> : IDisposable
+    where T : unmanaged
 {
-    // The borrowed array. Null once the batch is disposed.
-    private T[]? _array;
-
-    // The borrowed payload bytes. Null until the first AllocatePayload, and again once disposed.
-    private byte[]? _payload;
+    // The two states a batch can be in. An int, not a bool, so Interlocked can swap it.
+    private const int InUse = 0;
+    private const int Released = 1;
 
     // Payload items start on 8-byte boundaries, so any primitive type can be read efficiently.
     private const int PayloadAlignment = 8;
 
-    // The smallest payload buffer rented, so tiny first allocations don't grow it again at once.
+    // The smallest payload buffer created, so tiny first allocations don't grow it again at once.
     private const int MinimumPayloadBytes = 256;
 
+    // The pool this batch belongs to, or null for a standalone batch.
+    private readonly BatchPool<T>? _pool;
+
+    // The record array. A standalone batch sets it to null when disposed.
+    private T[]? _array;
+
+    // The payload bytes. Null until first needed, unless sized up front.
+    private byte[]? _payload;
+
+    private int _state;
+
     /// <summary>
-    /// Creates an empty batch with room for at least <paramref name="capacity"/> records.
+    /// Creates a standalone batch, outside any pipeline, with room for at least
+    /// <paramref name="capacity"/> records.
     /// </summary>
+    /// <remarks>
+    /// Inside a pipeline, rent batches from the writer instead (<see cref="IBatchWriter{T}.RentBatch"/>),
+    /// so they come from the pipeline's prepared pool.
+    /// </remarks>
     /// <param name="capacity">
-    /// The minimum number of records the batch must hold. The pool may supply a bigger array;
-    /// see <see cref="Capacity"/>.
+    /// The minimum number of records the batch must hold. The shared pool may supply a bigger
+    /// array; see <see cref="Capacity"/>.
     /// </param>
     /// <param name="sequence">
     /// This batch's position in the source's stream: 0 for the first batch, increasing by 1 each
     /// time. Lets downstream code detect missing batches.
     /// </param>
     /// <param name="payloadBytes">
-    /// How many payload bytes to reserve up front, if the source knows roughly how much nested data
-    /// the batch will carry. 0 (the default) rents nothing until <see cref="AllocatePayload"/> is
-    /// first called. The buffer grows when needed either way.
+    /// How many payload bytes to reserve up front. 0 (the default) reserves nothing until
+    /// <see cref="AllocatePayload"/> is first called. The buffer grows when needed either way.
     /// </param>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="capacity"/> is zero or negative, or <paramref name="payloadBytes"/> is negative.
@@ -81,36 +106,53 @@ public sealed class Batch<T> : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity);
         ArgumentOutOfRangeException.ThrowIfNegative(payloadBytes);
 
+        _array = ArrayPool<T>.Shared.Rent(capacity);
         if (payloadBytes > 0)
         {
             _payload = ArrayPool<byte>.Shared.Rent(payloadBytes);
         }
 
-        _array = ArrayPool<T>.Shared.Rent(capacity);
         Capacity = _array.Length;
         Sequence = sequence;
         CreatedTimestamp = Stopwatch.GetTimestamp();
+    }
+
+    // Creates a pooled batch. Its arrays are allocated here, once, and kept for its whole life.
+    // It starts released: the pool hands it out with Reset.
+    internal Batch(BatchPool<T> pool, int capacity, int payloadBytes)
+    {
+        _pool = pool;
+
+        // "Uninitialized" skips zeroing memory that the source overwrites anyway.
+        _array = GC.AllocateUninitializedArray<T>(capacity);
+        if (payloadBytes > 0)
+        {
+            _payload = GC.AllocateUninitializedArray<byte>(payloadBytes);
+        }
+
+        Capacity = capacity;
+        _state = Released;
     }
 
     /// <summary>
     /// This batch's position in the source's stream. A gap between consecutive batches
     /// (for example 39, then 41) means a batch was lost.
     /// </summary>
-    public long Sequence { get; }
+    public long Sequence { get; private set; }
 
     /// <summary>
-    /// When the batch was created, from <see cref="Stopwatch.GetTimestamp"/>.
+    /// When the batch was created or rented, from <see cref="Stopwatch.GetTimestamp"/>.
     /// Used to measure latency through the pipeline.
     /// </summary>
     /// <remarks>
     /// Stopwatch ticks, not a wall-clock time: they never jump backwards when the system clock is
     /// adjusted. Convert an interval with <see cref="Stopwatch.GetElapsedTime(long)"/>.
     /// </remarks>
-    public long CreatedTimestamp { get; }
+    public long CreatedTimestamp { get; private set; }
 
     /// <summary>
-    /// How many records fit in the batch: the length of the array actually received from the pool,
-    /// which may be larger than the capacity requested.
+    /// How many records fit in the batch. For a standalone batch this may be more than was
+    /// requested, because the shared pool hands out arrays in fixed sizes.
     /// </summary>
     public int Capacity { get; }
 
@@ -136,7 +178,7 @@ public sealed class Batch<T> : IDisposable
     /// </summary>
     /// <remarks>
     /// A fresh window over the array each time it is read; nothing is copied. Use it right away
-    /// and don't keep it: the array goes back to the pool when the batch is disposed.
+    /// and don't keep it: the array is reused once the batch is disposed.
     /// </remarks>
     /// <exception cref="ObjectDisposedException">The batch has been disposed.</exception>
     public ReadOnlySpan<T> Records => GetArray().AsSpan(0, Count);
@@ -151,7 +193,7 @@ public sealed class Batch<T> : IDisposable
     /// </exception>
     public void SetCount(int count)
     {
-        ObjectDisposedException.ThrowIf(_array is null, this);
+        _ = GetArray(); // Throws if disposed.
         ArgumentOutOfRangeException.ThrowIfNegative(count);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(count, Capacity);
         Count = count;
@@ -208,8 +250,7 @@ public sealed class Batch<T> : IDisposable
     /// Returns the items a <see cref="PayloadSlice{TItem}"/> points at, read-only.
     /// </summary>
     /// <remarks>
-    /// A view of the payload buffer; nothing is copied. Use it right away and don't keep it: the
-    /// buffer goes back to the pool when the batch is disposed.
+    /// A view of the payload buffer; nothing is copied. Use it right away and don't keep it.
     /// </remarks>
     /// <exception cref="ObjectDisposedException">The batch has been disposed.</exception>
     /// <exception cref="ArgumentOutOfRangeException">
@@ -258,39 +299,54 @@ public sealed class Batch<T> : IDisposable
     }
 
     /// <summary>
-    /// Returns the arrays to the pool. After this, <see cref="Buffer"/>, <see cref="Records"/> and
-    /// <see cref="SetCount"/> throw <see cref="ObjectDisposedException"/>.
+    /// Releases the batch: a pooled batch goes back to its pool for reuse, a standalone batch
+    /// returns its arrays to the shared pool. After this, every member throws
+    /// <see cref="ObjectDisposedException"/>.
     /// </summary>
     /// <remarks>
     /// Safe to call more than once, even from several threads at the same time: only the first
-    /// call returns the array, so it can never go back to the pool twice. The array is cleared on
-    /// return only when <typeparamref name="T"/> contains references, so the garbage collector can
-    /// free the objects they point to; plain structs skip that cost.
+    /// call releases anything. Arrays are never cleared, because unmanaged records hold no
+    /// references for the garbage collector to free (ADR 0005).
     /// </remarks>
     public void Dispose()
     {
-        // Swap the field to null and take the old value in one atomic step, so exactly one
-        // caller gets the array.
-        T[]? array = Interlocked.Exchange(ref _array, null);
-        if (array is null)
+        // Swap the state to Released and get the old state in one atomic step, so exactly one
+        // caller releases the batch.
+        if (Interlocked.Exchange(ref _state, Released) == Released)
         {
             return;
         }
 
-        ArrayPool<T>.Shared.Return(array, clearArray: RuntimeHelpers.IsReferenceOrContainsReferences<T>());
+        if (_pool is not null)
+        {
+            _pool.Return(this);
+            return;
+        }
 
-        // Only the caller that won the exchange above gets here, so this runs once. Payload bytes
-        // hold no references, so they never need clearing.
+        T[]? array = _array;
         byte[]? payload = _payload;
+        _array = null;
         _payload = null;
+
+        ArrayPool<T>.Shared.Return(array!);
         if (payload is not null)
         {
             ArrayPool<byte>.Shared.Return(payload);
         }
     }
 
+    // Makes a pooled batch ready for its next use. Called by the pool just before handing it out.
+    internal void Reset(long sequence)
+    {
+        Sequence = sequence;
+        CreatedTimestamp = Stopwatch.GetTimestamp();
+        Count = 0;
+        PayloadBytesUsed = 0;
+        Volatile.Write(ref _state, InUse);
+    }
+
     // Makes sure the payload buffer holds at least `needed` bytes, growing it if necessary, and
-    // returns it. Growing rents a bigger array, copies the bytes in use, and returns the old one.
+    // returns it. Growing creates a bigger buffer and copies the bytes in use.
     private byte[] EnsurePayloadCapacity(int needed)
     {
         byte[]? current = _payload;
@@ -302,24 +358,37 @@ public sealed class Batch<T> : IDisposable
         // Double, so a batch filled one record at a time grows only a few times.
         int doubled = (int)Math.Min((long)(current?.Length ?? 0) * 2, Array.MaxLength);
         int size = Math.Max(needed, Math.Max(doubled, MinimumPayloadBytes));
-        byte[] bigger = ArrayPool<byte>.Shared.Rent(size);
+
+        byte[] bigger;
+        if (_pool is not null)
+        {
+            // A pooled batch keeps its bigger buffer for good. Growing means the pool's payload
+            // size was too small for this data, so it is counted (ADR 0005, point 5).
+            bigger = GC.AllocateUninitializedArray<byte>(size);
+            _pool.OnPayloadGrown();
+        }
+        else
+        {
+            bigger = ArrayPool<byte>.Shared.Rent(size);
+        }
 
         if (current is not null)
         {
             current.AsSpan(0, PayloadBytesUsed).CopyTo(bigger);
-            ArrayPool<byte>.Shared.Return(current);
+            if (_pool is null)
+            {
+                ArrayPool<byte>.Shared.Return(current);
+            }
         }
 
         _payload = bigger;
         return bigger;
     }
 
-    // Returns the array, or throws if the batch is disposed. Reads the field once into a local,
-    // so it can't become null between the check and the use.
+    // Returns the array, or throws if the batch is released.
     private T[] GetArray()
     {
-        T[]? array = _array;
-        ObjectDisposedException.ThrowIf(array is null, this);
-        return array;
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _state) == Released, this);
+        return _array!;
     }
 }

@@ -6,11 +6,14 @@ namespace Laminar.Core;
 /// </summary>
 /// <typeparam name="T">The record type.</typeparam>
 /// <remarks>
-/// Sources push (ADR 0002): whenever data arrives, the source fills a <see cref="Batch{T}"/> and
-/// passes it to the writer. A source's job is to adapt whatever arrives into batches of
-/// <typeparamref name="T"/>.
+/// Sources push (ADR 0002): whenever data arrives, the source rents a batch from the writer
+/// (<see cref="IBatchWriter{T}.RentBatch"/>), fills it, and passes it back with
+/// <see cref="IBatchWriter{T}.WriteAsync"/>. A source's job is to turn whatever arrives (bytes,
+/// frames, objects) into batches of <typeparamref name="T"/>. A source must not fill a batch with
+/// more records than its <see cref="Batch{T}.Capacity"/>.
 /// </remarks>
 public interface ISource<T>
+    where T : unmanaged
 {
     /// <summary>
     /// Produces batches and pushes them to <paramref name="writer"/> until there is no more data or

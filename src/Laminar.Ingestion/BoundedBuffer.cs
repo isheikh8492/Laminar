@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Threading.Channels;
 using Laminar.Core;
 
@@ -11,8 +11,8 @@ namespace Laminar.Ingestion;
 /// <typeparam name="T">The record type.</typeparam>
 /// <remarks>
 /// <para>
-/// <b>Write side:</b> sources push through <see cref="WriteAsync"/> (this class is their
-/// <see cref="IBatchWriter{T}"/>). Several sources may write at the same time.
+/// <b>Write side:</b> sources push through <see cref="WriteAsync"/>, by way of the pipeline's
+/// <see cref="IBatchWriter{T}"/>. Several sources may write at the same time.
 /// </para>
 /// <para>
 /// <b>Read side:</b> exactly one reader, the ingestion worker, takes batches in order with
@@ -28,7 +28,8 @@ namespace Laminar.Ingestion;
 /// waiting. This class adds the policy mapping, drop handling and accounting.
 /// </para>
 /// </remarks>
-public sealed class BoundedBuffer<T> : IBatchWriter<T>
+public sealed class BoundedBuffer<T>
+    where T : unmanaged
 {
     private readonly Channel<Batch<T>> _channel;
 

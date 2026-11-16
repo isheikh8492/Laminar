@@ -1,4 +1,4 @@
-using Laminar.Core;
+﻿using Laminar.Core;
 
 namespace Laminar.Ingestion.Layout;
 
@@ -32,6 +32,10 @@ internal interface IPartWriter<TOwner>
     void Publish();
 
     void Rollback();
+
+    // Makes room for `items` owner items in advance (ADR 0005). Nested tables reserve only their
+    // offsets: how many nested items each owner has isn't known until data arrives.
+    void Reserve(long items);
 }
 
 /// <summary>A table's description, able to create a fresh writer for each store.</summary>
@@ -86,6 +90,14 @@ internal sealed class TableWriter<TOwner>(IPartWriter<TOwner>[] parts)
 
         Written = _published;
     }
+
+    public void Reserve(long items)
+    {
+        foreach (IPartWriter<TOwner> part in parts)
+        {
+            part.Reserve(items);
+        }
+    }
 }
 
 /// <summary>One column of a Columns table: calls the accessor once per item.</summary>
@@ -104,6 +116,8 @@ internal sealed class FieldWriter<TOwner, TValue>(Func<TOwner, PayloadReader, TV
     public void Publish() => column.Publish();
 
     public void Rollback() => column.Rollback();
+
+    public void Reserve(long items) => column.Reserve(items);
 }
 
 /// <summary>The rows of a Rows table: whole items, copied in bulk with no accessor calls.</summary>
@@ -115,6 +129,8 @@ internal sealed class RowWriter<TItem>(ChunkedColumn<TItem> column) : IPartWrite
     public void Publish() => column.Publish();
 
     public void Rollback() => column.Rollback();
+
+    public void Reserve(long items) => column.Reserve(items);
 }
 
 /// <summary>
@@ -162,4 +178,7 @@ internal sealed class ManyWriter<TOwner, TItem> : IPartWriter<TOwner>
         _child.Rollback();
         _offsets.Rollback();
     }
+
+    // One offset per owner, plus the leading 0.
+    public void Reserve(long items) => _offsets.Reserve(items + 1);
 }

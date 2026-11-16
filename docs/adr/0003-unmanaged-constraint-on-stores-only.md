@@ -1,6 +1,6 @@
-# 0003. The `unmanaged` constraint applies to stores, not the pipeline
+﻿# 0003. The `unmanaged` constraint applies to stores, not the pipeline
 
-**Status:** Accepted
+**Status:** Superseded by ADR 0005: records are `unmanaged` everywhere again.
 
 Supersedes the part of ADR 0001 that says record types must be `unmanaged` everywhere.
 

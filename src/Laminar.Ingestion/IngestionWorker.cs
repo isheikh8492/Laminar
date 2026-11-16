@@ -1,4 +1,4 @@
-using Laminar.Core;
+﻿using Laminar.Core;
 
 namespace Laminar.Ingestion;
 
@@ -24,6 +24,7 @@ namespace Laminar.Ingestion;
 /// </para>
 /// </remarks>
 public sealed class IngestionWorker<T>
+    where T : unmanaged
 {
     private readonly BoundedBuffer<T> _buffer;
     private readonly IRecordStore<T> _store;

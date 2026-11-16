@@ -12,6 +12,8 @@
 //   --capacity <n>          Buffer size in batches.                              Default 64.
 //   --policy <name>         Wait, DropIncoming or DropOldest.                    Default Wait.
 //   --seconds <n>           Stop after n seconds.                  Default: run until Ctrl+C.
+//   --reserve <seconds>     Pre-allocate store room for this many seconds at --rate,
+//                           in Prepare, before data arrives.                    Default 0.
 //   --detectors <n>         events only: values per event.                       Default 8.
 //   --samples <min>-<max>   events only: waveform length range.                  Default 32-128.
 
@@ -28,6 +30,7 @@ int? batchSize = null;
 int capacity = 64;
 FullBufferPolicy policy = FullBufferPolicy.Wait;
 double seconds = 0;
+double reserveSeconds = 0;
 int detectors = 8;
 int minSamples = 32;
 int maxSamples = 128;
@@ -47,6 +50,7 @@ try
             case "--capacity": capacity = int.Parse(NextValue(), CultureInfo.InvariantCulture); break;
             case "--policy": policy = Enum.Parse<FullBufferPolicy>(NextValue(), ignoreCase: true); break;
             case "--seconds": seconds = double.Parse(NextValue(), CultureInfo.InvariantCulture); break;
+            case "--reserve": reserveSeconds = double.Parse(NextValue(), CultureInfo.InvariantCulture); break;
             case "--detectors": detectors = int.Parse(NextValue(), CultureInfo.InvariantCulture); break;
             case "--samples":
                 string[] range = NextValue().Split('-');
@@ -72,7 +76,7 @@ catch (Exception ex) when (ex is FormatException or ArgumentException or Overflo
     Console.Error.WriteLine(ex.Message);
     Console.Error.WriteLine(
         "Usage: --source sim|events [--store row|layout] [--rate n] [--batch n] [--capacity n] " +
-        "[--policy Wait|DropIncoming|DropOldest] [--seconds n] [--detectors n] [--samples min-max]");
+        "[--policy Wait|DropIncoming|DropOldest] [--seconds n] [--reserve seconds] [--detectors n] [--samples min-max]");
     return 2;
 }
 
@@ -110,8 +114,7 @@ if (sourceName == "sim")
 else
 {
     var generator = new SimulatedEventGenerator(detectors, minSamples, maxSamples, rate);
-    var source = new SimulatedSource<SimulatedEvent>(
-        rate, batch, generator.Generate, generator.PayloadBytesPerBatch(batch));
+    var source = new SimulatedSource<SimulatedEvent>(rate, batch, generator.Generate);
 
     // Scalars and per-detector values as columns, each waveform as rows.
     var layout = RecordLayout.Columns<SimulatedEvent>("events", t =>
@@ -127,26 +130,54 @@ else
     });
 
     var store = new LayoutStore<SimulatedEvent>(layout);
+
+    // Waveform samples aren't covered by Reserve (it doesn't know how many each event has), so
+    // reserve them here from the average length, before the pipeline starts.
+    long reservedEvents = (long)(rate * reserveSeconds);
+    store.ReserveNested("waveform", reservedEvents * ((minSamples + maxSamples) / 2));
+
     return await RunAsync(
         $"events ({detectors} detectors, {minSamples}-{maxSamples} samples) → layout store",
-        source, store, () => DescribeTables(store));
+        source, store, () => DescribeTables(store), generator.PayloadBytesPerBatch(batch));
 }
 
 // Runs one pipeline until stopped, printing metrics every second, then checks the accounting.
 // Generic, so the same loop works for any record type and store.
-async Task<int> RunAsync<T>(string title, ISource<T> source, IRecordStore<T> store, Func<IEnumerable<string>> describe)
+async Task<int> RunAsync<T>(
+    string title,
+    ISource<T> source,
+    IRecordStore<T> store,
+    Func<IEnumerable<string>> describe,
+    int payloadBytesPerBatch = 0)
+    where T : unmanaged
 {
+    var options = new PipelineOptions
+    {
+        Policy = policy,
+        BatchCapacity = batch,
+        BufferCapacity = capacity,
+        PayloadBytesPerBatch = payloadBytesPerBatch,
+        ReserveRecords = (long)(rate * reserveSeconds),
+    };
+
     Console.WriteLine($"{title}");
-    Console.WriteLine($"rate={rate:N0}/s batch={batch:N0} capacity={capacity} policy={policy}");
+    Console.WriteLine(
+        $"rate={rate:N0}/s batch={batch:N0} capacity={capacity} policy={policy} " +
+        $"pool={options.PoolSize} batches, payload={payloadBytesPerBatch / 1e6:N1} MB/batch, reserve={reserveSeconds}s");
     Console.WriteLine("Ctrl+C to stop.");
+
+    await using var pipeline = new Pipeline<T>(source, store, options);
+
+    // Prepare allocates everything up front. Time it, so the cost is visible but kept out of the run.
+    long prepareStart = System.Diagnostics.Stopwatch.GetTimestamp();
+    pipeline.Prepare();
+    Console.WriteLine($"prepared in {System.Diagnostics.Stopwatch.GetElapsedTime(prepareStart).TotalMilliseconds:N0} ms");
     Console.WriteLine();
     Console.WriteLine(
         $"{"time",6} {"appended/s",12} {"fill",6} {"buffered",9} {"in flight",9} {"dropped",12} {"stored",14}" +
         $" │ {"gen0",5} {"gen1",5} {"gen2",5} {"alloc MB/s",11} {"gc pause",9}");
 
-    await using var pipeline = new Pipeline<T>(source, store, capacity, policy);
-
-    // GC readings at the start, so the per-second numbers cover only this run.
+    // GC readings taken after Prepare, so the numbers cover only the run itself.
     GcReading startGc = GcReading.Now();
     GcReading lastGc = startGc;
 
@@ -213,6 +244,9 @@ async Task<int> RunAsync<T>(string title, ISource<T> source, IRecordStore<T> sto
     Console.WriteLine(
         $"gc       {total.Gen0} gen0, {total.Gen1} gen1, {total.Gen2} gen2 collections; " +
         $"{total.AllocatedBytes / 1e6:N0} MB allocated; {total.Pause.TotalMilliseconds:N1} ms paused");
+    Console.WriteLine(
+        $"after prepare: {final.BatchesAllocatedAfterPrepare} batches allocated, {final.PayloadGrowths} payload growths " +
+        $"({(final.BatchesAllocatedAfterPrepare == 0 && final.PayloadGrowths == 0 ? "sizing was enough" : "sizing too small")})");
 
     Console.WriteLine();
     Console.WriteLine($"buffer empty, nothing in flight:  {(settled ? "OK" : "FAIL")}");
@@ -224,6 +258,7 @@ async Task<int> RunAsync<T>(string title, ISource<T> source, IRecordStore<T> sto
 
 // One line per table: its storage and how many items it holds.
 static IEnumerable<string> DescribeTables<T>(LayoutStore<T> store)
+    where T : unmanaged
 {
     foreach (TableSchema table in store.Schema.Tables)
     {

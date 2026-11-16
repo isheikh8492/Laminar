@@ -55,6 +55,10 @@ public sealed class RowStore<T> : IRecordStore<T>
     public T this[long index] => _records[index];
 
     /// <inheritdoc/>
+    /// <remarks>Must be called from the writer's thread, or before appending starts.</remarks>
+    public void Reserve(long records) => _records.Reserve(records);
+
+    /// <inheritdoc/>
     /// <remarks>
     /// Stores the records only. Payload slices inside them are kept as plain numbers, which mean
     /// nothing once the batch is gone; records with payload need a <see cref="Layout.LayoutStore{T}"/>

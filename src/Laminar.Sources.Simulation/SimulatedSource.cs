@@ -21,9 +21,9 @@ namespace Laminar.Sources.Simulation;
 /// </para>
 /// </remarks>
 public sealed class SimulatedSource<T> : ISource<T>
+    where T : unmanaged
 {
     private readonly Func<long, Batch<T>, T> _generate;
-    private readonly int _payloadBytesPerBatch;
 
     /// <summary>
     /// Creates a simulated source for flat records, with no nested data.
@@ -45,24 +45,20 @@ public sealed class SimulatedSource<T> : ISource<T>
     /// <param name="recordsPerSecond">The average rate to produce records at.</param>
     /// <param name="batchSize">How many records go in each batch.</param>
     /// <param name="generate">Makes the record with the given index, using the given batch's payload.</param>
-    /// <param name="payloadBytesPerBatch">
-    /// Payload bytes to reserve in each new batch, if roughly known. Avoids the buffer growing
-    /// several times per batch; 0 lets it grow as needed.
-    /// </param>
-    /// <exception cref="ArgumentOutOfRangeException">
-    /// The rate or the batch size is zero or negative, or <paramref name="payloadBytesPerBatch"/> is negative.
-    /// </exception>
-    public SimulatedSource(double recordsPerSecond, int batchSize, Func<long, Batch<T>, T> generate, int payloadBytesPerBatch = 0)
+    /// <remarks>
+    /// How much payload each batch starts with is the pipeline's sizing
+    /// (<see cref="PipelineOptions.PayloadBytesPerBatch"/>), not the source's.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The rate or the batch size is zero or negative.</exception>
+    public SimulatedSource(double recordsPerSecond, int batchSize, Func<long, Batch<T>, T> generate)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(recordsPerSecond);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(batchSize);
-        ArgumentOutOfRangeException.ThrowIfNegative(payloadBytesPerBatch);
         ArgumentNullException.ThrowIfNull(generate);
 
         RecordsPerSecond = recordsPerSecond;
         BatchSize = batchSize;
         _generate = generate;
-        _payloadBytesPerBatch = payloadBytesPerBatch;
     }
 
     /// <summary>The average rate records are produced at.</summary>
@@ -96,15 +92,33 @@ public sealed class SimulatedSource<T> : ISource<T>
                 continue;
             }
 
-            var batch = new Batch<T>(BatchSize, sequence++, _payloadBytesPerBatch);
-            Span<T> buffer = batch.Buffer;
+            // From the pipeline's prepared pool: no allocation here (ADR 0005).
+            Batch<T> batch = writer.RentBatch(sequence++);
 
-            for (int i = 0; i < BatchSize; i++)
+            try
             {
-                buffer[i] = _generate(produced + i, batch);
+                if (batch.Capacity < BatchSize)
+                {
+                    throw new InvalidOperationException(
+                        $"The source fills batches of {BatchSize} records, but the pipeline's batches hold " +
+                        $"{batch.Capacity}. Set PipelineOptions.BatchCapacity to at least {BatchSize}.");
+                }
+
+                Span<T> buffer = batch.Buffer;
+                for (int i = 0; i < BatchSize; i++)
+                {
+                    buffer[i] = _generate(produced + i, batch);
+                }
+
+                batch.SetCount(BatchSize);
+            }
+            catch
+            {
+                // Never pushed, so still ours: give it back to the pool.
+                batch.Dispose();
+                throw;
             }
 
-            batch.SetCount(BatchSize);
             produced += BatchSize;
 
             // Ownership passes to the writer here, whatever happens.

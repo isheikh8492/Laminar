@@ -1,4 +1,4 @@
-namespace Laminar.Ingestion;
+﻿namespace Laminar.Ingestion;
 
 /// <summary>
 /// A growable, append-only sequence of values stored in fixed-size chunks that never move: the
@@ -22,7 +22,7 @@ namespace Laminar.Ingestion;
 /// and SIMD instructions work at full speed.
 /// </para>
 /// </remarks>
-public sealed class ChunkedColumn<TItem>
+public sealed class ChunkedColumn<TItem> : IReservable
     where TItem : unmanaged
 {
     /// <summary>The chunk size used when none is given: 65,536 values.</summary>
@@ -84,7 +84,7 @@ public sealed class ChunkedColumn<TItem>
 
     /// <summary>
     /// Returns the published values of one chunk, read-only. Chunk <c>i</c> holds values
-    /// <c>i × ChunkSize</c> onwards.
+    /// <c>i Ã— ChunkSize</c> onwards.
     /// </summary>
     /// <remarks>
     /// A view of the chunk; nothing is copied. Safe to keep while the column exists, because chunks
@@ -172,6 +172,25 @@ public sealed class ChunkedColumn<TItem>
         }
     }
 
+    /// <summary>
+    /// Allocates chunks in advance until the column has room for at least
+    /// <paramref name="count"/> values in total, so appending up to that point allocates nothing.
+    /// </summary>
+    internal void Reserve(long count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+
+        // Chunks are only added at the end, and the write position moves onto them the normal way
+        // (AdvanceChunk finds the chunk already there instead of adding one).
+        while ((long)_chunkCount * ChunkSize < count)
+        {
+            AddChunk();
+        }
+    }
+
+    // Lets a store reserve a column it only knows as an object, without knowing its element type.
+    void IReservable.Reserve(long count) => Reserve(count);
+
     /// <summary>Makes every value written so far visible to readers.</summary>
     internal void Publish() => Volatile.Write(ref _count, _written);
 
@@ -220,8 +239,15 @@ public sealed class ChunkedColumn<TItem>
         }
 
         // One allocation per chunk, not per value. Chunks live as long as the column, so they are
-        // not rented from the pool.
-        chunks[_chunkCount] = new TItem[ChunkSize];
+        // not rented from the pool. "Uninitialized" skips zeroing memory that appends overwrite;
+        // readers never see it, because they stay below the published count.
+        chunks[_chunkCount] = GC.AllocateUninitializedArray<TItem>(ChunkSize);
         _chunkCount++;
     }
+}
+
+/// <summary>Something that can make room in advance. Lets stores reserve columns of any element type.</summary>
+internal interface IReservable
+{
+    void Reserve(long count);
 }

@@ -1,4 +1,4 @@
-using Laminar.Core;
+﻿using Laminar.Core;
 
 namespace Laminar.Ingestion.Layout;
 
@@ -22,11 +22,12 @@ public static class RecordLayout
     /// <summary>
     /// Starts a layout whose root table stores chosen fields as columns.
     /// </summary>
-    /// <typeparam name="T">The record type. Any type: only the chosen fields must be unmanaged.</typeparam>
+    /// <typeparam name="T">The record type.</typeparam>
     /// <param name="name">The root table's name.</param>
     /// <param name="configure">Chooses the fields and nested tables.</param>
     /// <exception cref="InvalidOperationException">The table ends up with no fields.</exception>
     public static RecordLayout<T> Columns<T>(string name, Action<TableBuilder<T>> configure)
+        where T : unmanaged
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(configure);
@@ -71,6 +72,7 @@ public static class RecordLayout
         TableStorage storage,
         Func<LayoutColumns, IPartWriter<T>>? rowsPart,
         Action<TableBuilder<T>>? configure)
+        where T : unmanaged
     {
         var context = new LayoutContext();
         var root = new TableBuilder<T>(context, name, storage, parent: null, rowsPart);
@@ -88,6 +90,7 @@ public static class RecordLayout
 /// </summary>
 /// <typeparam name="T">The record type.</typeparam>
 public sealed class RecordLayout<T>
+    where T : unmanaged
 {
     internal RecordLayout(LayoutSchema schema, TableDefinition<T> root)
     {
