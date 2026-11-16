@@ -90,6 +90,9 @@ public sealed class BoundedBuffer<T> : IBatchWriter<T>
     /// </param>
     /// <exception cref="OperationCanceledException">The write was cancelled while waiting for room.</exception>
     /// <exception cref="InvalidOperationException"><see cref="Complete"/> was already called.</exception>
+    /// <exception cref="Exception">
+    /// The buffer was completed with an error (see <see cref="Complete"/>); that error is rethrown.
+    /// </exception>
     public async ValueTask WriteAsync(Batch<T> batch, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(batch);
@@ -120,8 +123,10 @@ public sealed class BoundedBuffer<T> : IBatchWriter<T>
             {
                 canWrite = await _channel.Writer.WaitToWriteAsync(cancellationToken).ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            catch
             {
+                // Cancelled, or the buffer was completed with an error (WaitToWriteAsync then
+                // throws that error). Either way the batch is ours to count and dispose.
                 DropRejected(batch);
                 throw;
             }
@@ -175,6 +180,32 @@ public sealed class BoundedBuffer<T> : IBatchWriter<T>
     /// </param>
     /// <returns><see langword="false"/> if the buffer was already completed.</returns>
     public bool Complete(Exception? error = null) => _channel.Writer.TryComplete(error);
+
+    /// <summary>
+    /// Removes every batch still in the buffer, counting each as dropped and disposing it.
+    /// </summary>
+    /// <remarks>
+    /// For shutdown: call it after <see cref="Complete"/>, once the reader has stopped, so that
+    /// batches nobody will read are never lost silently or left holding pooled memory.
+    /// </remarks>
+    /// <returns>How many batches were discarded.</returns>
+    public int DiscardBuffered()
+    {
+        int discarded = 0;
+
+        lock (_gate)
+        {
+            while (_channel.Reader.TryRead(out Batch<T>? batch))
+            {
+                _batchesDropped++;
+                _recordsDropped += batch.Count;
+                batch.Dispose();
+                discarded++;
+            }
+        }
+
+        return discarded;
+    }
 
     /// <summary>
     /// Returns a consistent copy of the buffer's counters.
