@@ -76,13 +76,13 @@ public sealed class SimulatedEventGenerator
     {
         ArgumentNullException.ThrowIfNull(batch);
 
-        ulong h = Hash(index);
+        ulong h = SplitMix64.Hash(index);
 
         PayloadSlice<float> parameters = batch.AllocatePayload<float>(Detectors, out Span<float> values);
         for (int d = 0; d < values.Length; d++)
         {
             // A log-normal-ish spread, like fluorescence intensities.
-            values[d] = MathF.Exp(((Hash(h + (ulong)d) & 0xFFFF) / 6553.6f) - 2f) * 100f;
+            values[d] = MathF.Exp(((SplitMix64.Hash(h + (ulong)d) & 0xFFFF) / 6553.6f) - 2f) * 100f;
         }
 
         int range = MaxSamples - MinSamples + 1;
@@ -102,16 +102,5 @@ public sealed class SimulatedEventGenerator
             Ssc: (h >> 32 & 0xFFFF) / 65.535f,
             parameters,
             waveform);
-    }
-
-    // SplitMix64: a fast, well-mixed hash of a number, the usual choice for deterministic noise.
-    private static ulong Hash(long value) => Hash((ulong)value);
-
-    private static ulong Hash(ulong x)
-    {
-        x += 0x9E3779B97F4A7C15UL;
-        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9UL;
-        x = (x ^ (x >> 27)) * 0x94D049BB133111EBUL;
-        return x ^ (x >> 31);
     }
 }

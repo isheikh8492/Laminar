@@ -2,10 +2,14 @@
 //
 //   dotnet run --project bench/Laminar.TestBench -- --source sim --rate 100000
 //   dotnet run --project bench/Laminar.TestBench -- --source events --rate 100000 --detectors 12
+//   dotnet run --project bench/Laminar.TestBench -- --source spectral --rate 90000 --samples 64 --seconds 10
 //
 // Options:
-//   --source sim|events     sim: flat sine-wave samples. events: instrument-like events with
-//                           per-detector values and a variable-length waveform.  Default sim.
+//   --source sim|events|spectral
+//                           sim: flat sine-wave samples. events: instrument-like events with
+//                           per-detector values and a variable-length waveform. spectral:
+//                           spectral cytometry events (lasers × channels × features, and a
+//                           waveform per channel), with Poisson arrival times.  Default sim.
 //   --store row|layout      Where records go. events always uses layout.        Default row.
 //   --rate <n>              Records per second.                                  Default 100000.
 //   --batch <n>             Records per batch.                     Default: about 100 batches/s.
@@ -15,7 +19,14 @@
 //   --reserve <seconds>     Pre-allocate store room for this many seconds at --rate,
 //                           in Prepare, before data arrives.                    Default 0.
 //   --detectors <n>         events only: values per event.                       Default 8.
-//   --samples <min>-<max>   events only: waveform length range.                  Default 32-128.
+//   --samples <min>-<max>   events: waveform length range.                       Default 32-128.
+//                           spectral: one number, samples per channel.           Default 64.
+//   --lasers <n>            spectral only.                                       Default 7.
+//   --channels <n>          spectral only: channels across all lasers.           Default 60.
+//   --features <n>          spectral only: features per channel.                 Default 9.
+//   --feature-storage columns|rows
+//                           spectral only. columns: one column per channel × feature, best
+//                           for plots. rows: each event's features as one block.  Default columns.
 
 using System.Globalization;
 using Laminar.Core;
@@ -34,6 +45,11 @@ double reserveSeconds = 0;
 int detectors = 8;
 int minSamples = 32;
 int maxSamples = 128;
+bool samplesGiven = false;
+int lasers = 7;
+int channels = 60;
+int features = 9;
+string featureStorage = "columns";
 
 try
 {
@@ -56,14 +72,24 @@ try
                 string[] range = NextValue().Split('-');
                 minSamples = int.Parse(range[0], CultureInfo.InvariantCulture);
                 maxSamples = int.Parse(range[^1], CultureInfo.InvariantCulture);
+                samplesGiven = true;
                 break;
+            case "--lasers": lasers = int.Parse(NextValue(), CultureInfo.InvariantCulture); break;
+            case "--channels": channels = int.Parse(NextValue(), CultureInfo.InvariantCulture); break;
+            case "--features": features = int.Parse(NextValue(), CultureInfo.InvariantCulture); break;
+            case "--feature-storage": featureStorage = NextValue(); break;
             default: throw new FormatException($"Unknown option {args[i]}.");
         }
     }
 
-    if (sourceName is not ("sim" or "events"))
+    if (sourceName is not ("sim" or "events" or "spectral"))
     {
-        throw new FormatException($"Unknown source '{sourceName}'. Use sim or events.");
+        throw new FormatException($"Unknown source '{sourceName}'. Use sim, events or spectral.");
+    }
+
+    if (featureStorage is not ("columns" or "rows"))
+    {
+        throw new FormatException($"Unknown feature storage '{featureStorage}'. Use columns or rows.");
     }
 
     if (storeName is not ("row" or "layout"))
@@ -75,8 +101,9 @@ catch (Exception ex) when (ex is FormatException or ArgumentException or Overflo
 {
     Console.Error.WriteLine(ex.Message);
     Console.Error.WriteLine(
-        "Usage: --source sim|events [--store row|layout] [--rate n] [--batch n] [--capacity n] " +
-        "[--policy Wait|DropIncoming|DropOldest] [--seconds n] [--reserve seconds] [--detectors n] [--samples min-max]");
+        "Usage: --source sim|events|spectral [--store row|layout] [--rate n] [--batch n] [--capacity n] " +
+        "[--policy Wait|DropIncoming|DropOldest] [--seconds n] [--reserve seconds] [--detectors n] [--samples min-max] " +
+        "[--lasers n] [--channels n] [--features n] [--feature-storage columns|rows]");
     return 2;
 }
 
@@ -110,6 +137,61 @@ if (sourceName == "sim")
         .Field("value", s => s.Value));
     var store = new LayoutStore<SimulatedSample>(layout);
     return await RunAsync("sim → layout store (columns)", source, store, () => DescribeTables(store));
+}
+else if (sourceName == "spectral")
+{
+    int samples = samplesGiven ? maxSamples : 64;
+    var generator = new SpectralEventGenerator(rate, lasers, channels, features, samples);
+    var source = new SimulatedSource<SpectralEvent>(rate, batch, generator.Generate);
+
+    // Scalars as columns. Features either as one column per channel × feature (what plots and
+    // gates read), or as one block of rows per event. Waveforms as one block of rows per event.
+    var layout = RecordLayout.Columns<SpectralEvent>("events", t =>
+    {
+        t.Field("time", e => e.Time).Field("population", e => e.Population);
+
+        if (featureStorage == "columns")
+        {
+            for (int c = 0; c < channels; c++)
+            {
+                for (int f = 0; f < features; f++)
+                {
+                    int k = (c * features) + f; // Copied, so each accessor keeps its own value.
+                    t.Field($"L{generator.LaserOf(c) + 1}-ch{c + 1:00}-f{f + 1}", (e, payload) => payload.Get(e.Features)[k]);
+                }
+            }
+        }
+        else
+        {
+            t.Many("features", e => e.Features, TableStorage.Rows);
+        }
+
+        if (samples > 0)
+        {
+            t.Many("waveforms", e => e.Waveforms, TableStorage.Rows);
+        }
+    });
+
+    var store = new LayoutStore<SpectralEvent>(layout);
+
+    long reservedEvents = (long)(rate * reserveSeconds);
+    if (featureStorage == "rows")
+    {
+        store.ReserveNested("features", reservedEvents * channels * features);
+    }
+
+    if (samples > 0)
+    {
+        store.ReserveNested("waveforms", reservedEvents * channels * samples);
+    }
+
+    // Bytes stored per event: time and population, plus the payload.
+    long bytesPerEvent = sizeof(long) + sizeof(int) + generator.PayloadBytesPerEvent;
+    return await RunAsync(
+        $"spectral ({lasers} lasers, {channels} channels × {features} features, {channels} × {samples} samples, " +
+        $"features as {featureStorage}) → layout store\n" +
+        $"{bytesPerEvent / 1024.0:N1} KB/event, {rate * bytesPerEvent / 1e6:N0} MB/s at the target rate",
+        source, store, () => DescribeTables(store), generator.PayloadBytesPerBatch(batch));
 }
 else
 {
