@@ -81,8 +81,10 @@ as a user widens or narrows a view.
    Reading below `FirstRetained` reports the item as evicted, never another item's data.
    Offsets also stay absolute, so asking for an evicted event's waveform reports it evicted.
 
-6. **Windows are "at least n".** Memory is freed one whole chunk at a time, so a window may hold
-   up to one chunk more than asked. `FirstRetained` always says exactly what is readable.
+6. **Windows are exactly n readable items; memory may hold up to one chunk more.** Memory is
+   freed one whole chunk at a time, so the oldest chunk may still hold items below the window.
+   They are not readable: `FirstRetained` is the window's exact start, the same in every column of
+   the table.
 
 7. **What can't survive is never stored.** When a batch alone holds more than a window, as with
    `Latest(5)` waveforms and 900-event batches, only the items that can survive are written. The

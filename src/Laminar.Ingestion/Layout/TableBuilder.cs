@@ -21,6 +21,7 @@ public sealed class TableBuilder<TOwner>
     private readonly string _name;
     private readonly TableStorage _storage;
     private readonly string? _parent;
+    private readonly Retention _retention;
     private readonly List<FieldSchema> _fields = [];
     private readonly HashSet<string> _fieldNames = [];
     private readonly List<Func<LayoutColumns, IPartWriter<TOwner>>> _parts = [];
@@ -31,13 +32,20 @@ public sealed class TableBuilder<TOwner>
         string name,
         TableStorage storage,
         string? parent,
+        Retention retention,
         Func<LayoutColumns, IPartWriter<TOwner>>? rowsPart)
     {
+        if (parent is null && retention.Kind == RetentionKind.SameAsParent)
+        {
+            throw new ArgumentException($"'{name}' is the root table, so it has no parent to follow.", nameof(retention));
+        }
+
         _context = context;
         _index = context.Reserve(name);
         _name = name;
         _storage = storage;
         _parent = parent;
+        _retention = retention;
 
         if (rowsPart is not null)
         {
@@ -94,6 +102,7 @@ public sealed class TableBuilder<TOwner>
         {
             var column = new ChunkedColumn<TValue>(columns.ChunkSize);
             columns.Fields[(table, name)] = column;
+            columns.Register(table, column);
             return new FieldWriter<TOwner, TValue>(get, column);
         });
 
@@ -115,18 +124,36 @@ public sealed class TableBuilder<TOwner>
     /// <param name="configure">
     /// Describes the nested table: its fields, and further nested tables to any depth.
     /// </param>
-    /// <exception cref="ArgumentException">The name is empty or already used in this layout.</exception>
+    /// <param name="retain">
+    /// How much of the nested table stays in memory (ADR 0006), counted in items of <i>this</i>
+    /// table: <c>Retention.Latest(5)</c> keeps the nested items of the latest 5 items here. The
+    /// default keeps them as long as this table keeps their owners.
+    /// </param>
+    /// <exception cref="ArgumentException">
+    /// The name is empty or already used in this layout, or <paramref name="retain"/> keeps more
+    /// than this table does.
+    /// </exception>
     public TableBuilder<TOwner> Many<TItem>(
         string name,
         Func<TOwner, PayloadSlice<TItem>> select,
         TableStorage storage,
-        Action<TableBuilder<TItem>>? configure = null)
+        Action<TableBuilder<TItem>>? configure = null,
+        Retention retain = default)
         where TItem : unmanaged
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(select);
 
-        var child = new TableBuilder<TItem>(_context, name, storage, _name, RecordLayout.RowsPart<TItem>(name, storage));
+        // A nested table never keeps more than its parent (ADR 0006, point 3).
+        if (retain.Kind == RetentionKind.Latest && _retention.Kind == RetentionKind.Latest && retain.Items > _retention.Items)
+        {
+            throw new ArgumentException(
+                $"'{name}' would keep the items of the latest {retain.Items:N0} items of '{_name}', but '{_name}' " +
+                $"only keeps {_retention.Items:N0}. A nested table can't keep more than its parent.",
+                nameof(retain));
+        }
+
+        var child = new TableBuilder<TItem>(_context, name, storage, _name, retain, RecordLayout.RowsPart<TItem>(name, storage));
         configure?.Invoke(child);
         TableDefinition<TItem> definition = child.Complete();
 
@@ -134,6 +161,7 @@ public sealed class TableBuilder<TOwner>
         {
             var offsets = new ChunkedColumn<long>(columns.ChunkSize);
             columns.Offsets[name] = offsets;
+            columns.Register(name, offsets);
             return new ManyWriter<TOwner, TItem>(select, definition.CreateWriter(columns), offsets);
         });
 
@@ -150,8 +178,8 @@ public sealed class TableBuilder<TOwner>
                 $"Table '{_name}' stores columns but has no fields. Add at least one Field or Many.");
         }
 
-        _context.Set(_index, new TableSchema(_name, _storage, typeof(TOwner), _parent, _fields.ToArray()));
-        return new TableDefinition<TOwner>([.. _parts]);
+        _context.Set(_index, new TableSchema(_name, _storage, typeof(TOwner), _parent, _fields.ToArray(), _retention));
+        return new TableDefinition<TOwner>(_name, _retention, [.. _parts]);
     }
 }
 

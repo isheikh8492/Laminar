@@ -27,6 +27,10 @@
 //   --feature-storage columns|rows
 //                           spectral only. columns: one column per channel × feature, best
 //                           for plots. rows: each event's features as one block.  Default columns.
+//   --retain <n>            events and spectral: keep only the latest n events in memory (ADR 0006).
+//                           Default: keep all.
+//   --waveform-retain <n>   events and spectral: keep only the latest n events' waveforms.
+//                           Default: as long as their events.
 
 using System.Globalization;
 using Laminar.Core;
@@ -50,6 +54,8 @@ int lasers = 7;
 int channels = 60;
 int features = 9;
 string featureStorage = "columns";
+long? retainEvents = null;
+long? retainWaveforms = null;
 
 try
 {
@@ -78,6 +84,8 @@ try
             case "--channels": channels = int.Parse(NextValue(), CultureInfo.InvariantCulture); break;
             case "--features": features = int.Parse(NextValue(), CultureInfo.InvariantCulture); break;
             case "--feature-storage": featureStorage = NextValue(); break;
+            case "--retain": retainEvents = long.Parse(NextValue(), CultureInfo.InvariantCulture); break;
+            case "--waveform-retain": retainWaveforms = long.Parse(NextValue(), CultureInfo.InvariantCulture); break;
             default: throw new FormatException($"Unknown option {args[i]}.");
         }
     }
@@ -103,9 +111,13 @@ catch (Exception ex) when (ex is FormatException or ArgumentException or Overflo
     Console.Error.WriteLine(
         "Usage: --source sim|events|spectral [--store row|layout] [--rate n] [--batch n] [--capacity n] " +
         "[--policy Wait|DropIncoming|DropOldest] [--seconds n] [--reserve seconds] [--detectors n] [--samples min-max] " +
-        "[--lasers n] [--channels n] [--features n] [--feature-storage columns|rows]");
+        "[--lasers n] [--channels n] [--features n] [--feature-storage columns|rows] " +
+        "[--retain n] [--waveform-retain n]");
     return 2;
 }
+
+Retention eventRetention = retainEvents is { } re ? Retention.Latest(re) : Retention.KeepAll;
+Retention waveformRetention = retainWaveforms is { } rw ? Retention.Latest(rw) : Retention.KeepAll;
 
 // Aim for about 100 batches per second unless told otherwise.
 int batch = batchSize ?? (int)Math.Clamp(rate / 100, 1, 10_000);
@@ -168,9 +180,9 @@ else if (sourceName == "spectral")
 
         if (samples > 0)
         {
-            t.Many("waveforms", e => e.Waveforms, TableStorage.Rows);
+            t.Many("waveforms", e => e.Waveforms, TableStorage.Rows, retain: waveformRetention);
         }
-    });
+    }, eventRetention);
 
     var store = new LayoutStore<SpectralEvent>(layout);
 
@@ -182,7 +194,7 @@ else if (sourceName == "spectral")
 
     if (samples > 0)
     {
-        store.ReserveNested("waveforms", reservedEvents * channels * samples);
+        store.ReserveNested("waveforms", Math.Min(reservedEvents, retainWaveforms ?? retainEvents ?? long.MaxValue) * channels * samples);
     }
 
     // Bytes stored per event: time and population, plus the payload.
@@ -208,15 +220,15 @@ else
             t.Field($"FL{d + 1}", (e, payload) => payload.Get(e.Parameters)[k]);
         }
 
-        t.Many("waveform", e => e.Waveform, TableStorage.Rows);
-    });
+        t.Many("waveform", e => e.Waveform, TableStorage.Rows, retain: waveformRetention);
+    }, eventRetention);
 
     var store = new LayoutStore<SimulatedEvent>(layout);
 
     // Waveform samples aren't covered by Reserve (it doesn't know how many each event has), so
     // reserve them here from the average length, before the pipeline starts.
     long reservedEvents = (long)(rate * reserveSeconds);
-    store.ReserveNested("waveform", reservedEvents * ((minSamples + maxSamples) / 2));
+    store.ReserveNested("waveform", Math.Min(reservedEvents, retainWaveforms ?? retainEvents ?? long.MaxValue) * ((minSamples + maxSamples) / 2));
 
     return await RunAsync(
         $"events ({detectors} detectors, {minSamples}-{maxSamples} samples) → layout store",
@@ -338,25 +350,23 @@ async Task<int> RunAsync<T>(
     return settled && balanced && stored ? 0 : 1;
 }
 
-// One line per table: its storage and how many items it holds.
+// One line per table: its storage, retention, and how many items it has had and still holds.
 static IEnumerable<string> DescribeTables<T>(LayoutStore<T> store)
     where T : unmanaged
 {
     foreach (TableSchema table in store.Schema.Tables)
     {
-        // The root table holds one item per record. A nested table's last offset is where its
-        // final parent's items end, which is its total item count.
-        long items = table.Parent is null ? store.Count : LastOffset(store.GetOffsets(table.Name));
+        TableMetrics m = store.GetTableMetrics(table.Name);
 
         string under = table.Parent is null ? "" : $" under {table.Parent}";
         string what = table.Storage == TableStorage.Rows
             ? $"rows of {table.ItemType.Name}"
             : $"{table.Fields.Count} columns";
 
-        yield return $"  table {table.Name,-10} {what,-18}{under,-14} {items,14:N0} items";
+        yield return
+            $"  table {table.Name,-10} {what,-18}{under,-14} {m.Count,16:N0} items, {m.InMemory,14:N0} in memory " +
+            $"({m.Retention}); {m.EvictedOnArrival:N0} never stored; chunks {m.ChunksAllocated:N0} allocated, {m.ChunksFreed:N0} freed";
     }
-
-    static long LastOffset(ChunkedColumn<long> offsets) => offsets[offsets.Count - 1];
 }
 
 // A snapshot of the garbage collector's running totals. Subtracting two gives what happened

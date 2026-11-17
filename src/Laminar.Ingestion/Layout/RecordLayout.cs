@@ -25,14 +25,16 @@ public static class RecordLayout
     /// <typeparam name="T">The record type.</typeparam>
     /// <param name="name">The root table's name.</param>
     /// <param name="configure">Chooses the fields and nested tables.</param>
+    /// <param name="retain">How many records stay in memory (ADR 0006). Everything, by default.</param>
     /// <exception cref="InvalidOperationException">The table ends up with no fields.</exception>
-    public static RecordLayout<T> Columns<T>(string name, Action<TableBuilder<T>> configure)
+    /// <exception cref="ArgumentException"><paramref name="retain"/> is <see cref="Retention.SameAsParent"/>.</exception>
+    public static RecordLayout<T> Columns<T>(string name, Action<TableBuilder<T>> configure, Retention retain = default)
         where T : unmanaged
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(configure);
 
-        return Build(name, TableStorage.Columns, rowsPart: null, configure);
+        return Build(name, TableStorage.Columns, retain, rowsPart: null, configure);
     }
 
     /// <summary>
@@ -41,12 +43,14 @@ public static class RecordLayout
     /// <typeparam name="T">The record type; must be unmanaged to be stored whole.</typeparam>
     /// <param name="name">The root table's name.</param>
     /// <param name="configure">Adds nested tables, if any. Rows tables have no fields.</param>
-    public static RecordLayout<T> Rows<T>(string name, Action<TableBuilder<T>>? configure = null)
+    /// <param name="retain">How many records stay in memory (ADR 0006). Everything, by default.</param>
+    /// <exception cref="ArgumentException"><paramref name="retain"/> is <see cref="Retention.SameAsParent"/>.</exception>
+    public static RecordLayout<T> Rows<T>(string name, Action<TableBuilder<T>>? configure = null, Retention retain = default)
         where T : unmanaged
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
-        return Build(name, TableStorage.Rows, RowsPart<T>(name, TableStorage.Rows), configure);
+        return Build(name, TableStorage.Rows, retain, RowsPart<T>(name, TableStorage.Rows), configure);
     }
 
     // The part that stores whole items, for a Rows table; null for a Columns table. It lives here,
@@ -63,6 +67,7 @@ public static class RecordLayout
         {
             var rows = new ChunkedColumn<TItem>(columns.ChunkSize);
             columns.Rows[table] = rows;
+            columns.Register(table, rows);
             return new RowWriter<TItem>(rows);
         };
     }
@@ -70,12 +75,13 @@ public static class RecordLayout
     private static RecordLayout<T> Build<T>(
         string name,
         TableStorage storage,
+        Retention retain,
         Func<LayoutColumns, IPartWriter<T>>? rowsPart,
         Action<TableBuilder<T>>? configure)
         where T : unmanaged
     {
         var context = new LayoutContext();
-        var root = new TableBuilder<T>(context, name, storage, parent: null, rowsPart);
+        var root = new TableBuilder<T>(context, name, storage, parent: null, retain, rowsPart);
         configure?.Invoke(root);
         TableDefinition<T> definition = root.Complete();
 

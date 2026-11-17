@@ -41,12 +41,17 @@ public sealed record FieldSchema(string Name, Type Type);
 /// <c>offsets[i + 1]</c>.
 /// </param>
 /// <param name="Fields">The columns, in order. Empty for a <see cref="TableStorage.Rows"/> table.</param>
+/// <param name="Retention">
+/// How much of the table stays in memory, as declared in the layout (ADR 0006). It can change
+/// during a run; the store reports the current one.
+/// </param>
 public sealed record TableSchema(
     string Name,
     TableStorage Storage,
     Type ItemType,
     string? Parent,
-    IReadOnlyList<FieldSchema> Fields);
+    IReadOnlyList<FieldSchema> Fields,
+    Retention Retention = default);
 
 /// <summary>
 /// The plain-data half of a layout: every table, its storage, fields and nesting (ADR 0004). It
